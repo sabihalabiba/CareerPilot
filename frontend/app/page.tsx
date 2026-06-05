@@ -428,6 +428,18 @@ const [newTodoPriority, setNewTodoPriority] = useState("medium");
                   <div>
                     <p className="font-black text-white text-xl">{job.title}</p>
                     <p className="text-sm mt-1" style={{ color: "rgba(255,255,255,0.5)" }}>{job.company} · {job.location}</p>
+    {job.source === "real" && (
+  <span className="text-xs px-2 py-0.5 rounded-full font-bold"
+    style={{ background: "rgba(16,185,129,0.15)", color: "#6ee7b7", border: "1px solid rgba(16,185,129,0.2)" }}>
+    ✓ Real listing
+  </span>
+)}
+{job.source === "ai_generated" && (
+  <span className="text-xs px-2 py-0.5 rounded-full font-bold"
+    style={{ background: "rgba(251,191,36,0.15)", color: "#fde68a", border: "1px solid rgba(251,191,36,0.2)" }}>
+    ⚡ AI suggested
+  </span>
+)}                
                   </div>
                   <span className={`text-sm font-black px-4 py-2 rounded-full ${job.fit_score >= 80 ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30" : "bg-amber-500/20 text-amber-400 border border-amber-500/30"}`}>
                     {job.fit_score}% fit
@@ -445,11 +457,20 @@ const [newTodoPriority, setNewTodoPriority] = useState("medium");
                   {job.required_skills?.map((s: string, j: number) => (
                     <span key={j} className="text-xs px-3 py-1 rounded-full" style={{ background: "rgba(255,255,255,0.08)", color: "rgba(255,255,255,0.6)" }}>{s}</span>
                   ))}
-                  <button onClick={() => trackJob(job)}
-                    className="ml-auto text-xs font-bold px-4 py-1.5 rounded-full transition"
-                    style={{ background: "rgba(124,58,237,0.2)", border: "1px solid rgba(124,58,237,0.4)", color: "#a78bfa" }}>
-                    + Track
-                  </button>
+<div className="ml-auto flex gap-2">
+  {job.apply_url && (
+    <a href={job.apply_url} target="_blank" rel="noopener noreferrer"
+      className="text-xs font-bold px-4 py-1.5 rounded-full transition"
+      style={{ background: "rgba(16,185,129,0.2)", border: "1px solid rgba(16,185,129,0.4)", color: "#6ee7b7" }}>
+      Apply →
+    </a>
+  )}
+  <button onClick={() => trackJob(job)}
+    className="text-xs font-bold px-4 py-1.5 rounded-full transition"
+    style={{ background: "rgba(124,58,237,0.2)", border: "1px solid rgba(124,58,237,0.4)", color: "#a78bfa" }}>
+    + Track
+  </button>
+</div>
                 </div>
               </div>
             ))}

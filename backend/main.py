@@ -14,6 +14,8 @@ load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID")
+ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY")
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -124,15 +126,44 @@ def find_relevant_chunks(chunks, question, max_chunks=3):
 
 
 def get_memory(user_id):
-    return memory_store.get(user_id, [])
+    """Get last 8 messages from database"""
+    if user_id in memory_store and len(memory_store[user_id]) > 0:
+        return memory_store[user_id]
+    # Load from database
+    data = db_get("conversation_memory",
+        f"user_id=eq.{user_id}&order=created_at.asc&limit=8")
+    if isinstance(data, list) and data:
+        messages = [{"role": d["role"], "content": d["content"]} for d in data]
+        memory_store[user_id] = messages
+        return messages
+    return []
 
 
 def save_memory(user_id, role, content):
+    """Save message to memory and database"""
     if user_id not in memory_store:
         memory_store[user_id] = []
     memory_store[user_id].append({"role": role, "content": content})
     if len(memory_store[user_id]) > 8:
         memory_store[user_id] = memory_store[user_id][-8:]
+
+    # Save to database
+    db_post("conversation_memory", {
+        "user_id": user_id,
+        "role": role,
+        "content": content[:2000]  # limit size
+    })
+
+    # Keep only last 8 in database too
+    data = db_get("conversation_memory",
+        f"user_id=eq.{user_id}&order=created_at.asc")
+    if isinstance(data, list) and len(data) > 8:
+        old_ids = [d["id"] for d in data[:-8]]
+        for old_id in old_ids:
+            httpx.delete(
+                f"{SUPABASE_URL}/rest/v1/conversation_memory?id=eq.{old_id}",
+                headers=HEADERS
+            )
 
 
 # ── Models ─────────────────────────────────────────────────────
@@ -264,42 +295,105 @@ Keep total response under 250 words. Be sharp, be specific, be useful."""
 @app.post("/fit-score")
 async def fit_score(req: FitRequest):
     cv_text = get_cv(req.user_id)
+    if not cv_text:
+        return {"error": "Please upload your CV first!"}
 
+    # Step 1: Extract CV skills
     cv_skills_raw = ask_ai([
-        {"role": "system", "content": "You are a technical skills extractor. Return ONLY a valid JSON array of strings. No explanation."},
-        {"role": "user", "content": f"Extract every technical skill, tool, language, framework, and technology from this CV. Include soft skills if relevant.\n\nCV:\n{cv_text}\n\nReturn format: [\"Python\", \"FastAPI\", \"SQL\"]"}
+        {"role": "system", "content": "Extract skills from CVs. Return ONLY a JSON array. No explanation."},
+        {"role": "user", "content": f"Extract ALL technical skills, tools, languages, frameworks from this CV. Include variations (e.g. both 'ML' and 'Machine Learning').\n\nCV:\n{cv_text}\n\nReturn format: [\"Python\", \"Machine Learning\", \"ML\", \"FastAPI\"]"}
     ])
     try:
-        cv_skills_raw = cv_skills_raw.replace("```json", "").replace("```", "").strip()
+        cv_skills_raw = cv_skills_raw.replace("```json","").replace("```","").strip()
         cv_skills = json.loads(cv_skills_raw[cv_skills_raw.find("["):cv_skills_raw.rfind("]")+1])
     except:
         cv_skills = []
 
+    # Step 2: Extract JD requirements
     jd_skills_raw = ask_ai([
-        {"role": "system", "content": "You are a job requirements extractor. Return ONLY a valid JSON array of strings. No explanation."},
-        {"role": "user", "content": f"Extract every required skill, tool, technology, and qualification from this job description.\n\nJD:\n{req.job_description}\n\nReturn format: [\"Python\", \"Docker\", \"AWS\"]"}
+        {"role": "system", "content": "Extract requirements from job descriptions. Return ONLY a JSON array."},
+        {"role": "user", "content": f"Extract ALL required skills, qualifications and tools from this JD.\n\nJD:\n{req.job_description}\n\nReturn format: [\"Python\", \"3 years experience\", \"Docker\"]"}
     ])
     try:
-        jd_skills_raw = jd_skills_raw.replace("```json", "").replace("```", "").strip()
+        jd_skills_raw = jd_skills_raw.replace("```json","").replace("```","").strip()
         jd_skills = json.loads(jd_skills_raw[jd_skills_raw.find("["):jd_skills_raw.rfind("]")+1])
     except:
         jd_skills = []
 
-    cv_lower = [s.lower() for s in cv_skills]
-    matched = [s for s in jd_skills if s.lower() in cv_lower]
-    missing = [s for s in jd_skills if s.lower() not in cv_lower]
-    match_score = round((len(matched) / len(jd_skills)) * 100) if jd_skills else 50
+    # Step 3: Semantic matching using AI
+    # Instead of exact string matching, ask AI to judge each skill
+    match_prompt = f"""You are a technical recruiter doing skill matching.
 
-    recommendation = ask_ai([
-        {"role": "system", "content": "You are a senior tech recruiter. Be direct and specific."},
-        {"role": "user", "content": f"Candidate scored {match_score}% match.\nMatched: {matched}\nMissing: {missing}\nWrite ONE sharp professional sentence: should they apply and what is the single most important thing to fix?"}
-    ])
+CV Skills: {cv_skills}
+Job Requirements: {jd_skills}
+
+For each job requirement, determine if the CV has a matching or equivalent skill.
+Consider synonyms: "ML" = "Machine Learning", "JS" = "JavaScript", "Postgres" = "PostgreSQL" etc.
+
+Return EXACT JSON:
+{{
+  "matched": ["requirement1", "requirement2"],
+  "missing": ["requirement3", "requirement4"],
+  "partial": ["requirement5 (has related skill but not exact)"]
+}}"""
+
+    match_raw = ask_ai([{"role": "user", "content": match_prompt}])
+    match_data = parse_json(match_raw)
+
+    if match_data:
+        matched = match_data.get("matched", [])
+        missing = match_data.get("missing", [])
+        partial = match_data.get("partial", [])
+        total = len(matched) + len(missing) + len(partial)
+        match_score = round(((len(matched) + len(partial) * 0.5) / max(total, 1)) * 100)
+    else:
+        cv_lower = [s.lower() for s in cv_skills]
+        matched = [s for s in jd_skills if s.lower() in cv_lower]
+        missing = [s for s in jd_skills if s.lower() not in cv_lower]
+        partial = []
+        match_score = round((len(matched) / max(len(jd_skills), 1)) * 100)
+
+    # Step 4: Experience level check
+    exp_prompt = f"""Compare experience levels.
+CV: {cv_text[:400]}
+JD: {req.job_description[:400]}
+
+Return JSON:
+{{
+  "years_required": "2+ years",
+  "years_candidate_has": "1 year internship",
+  "experience_verdict": "slightly underqualified"
+}}"""
+    exp_raw = ask_ai([{"role": "user", "content": exp_prompt}])
+    exp_data = parse_json(exp_raw)
+
+    # Adjust score for experience
+    if exp_data:
+        verdict = exp_data.get("experience_verdict", "")
+        if "overqualified" in verdict or "strong" in verdict:
+            match_score = min(match_score + 5, 99)
+        elif "underqualified" in verdict or "lacking" in verdict:
+            match_score = max(match_score - 10, 5)
+
+    # Step 5: Generate recommendation
+    rec_prompt = f"""Candidate scored {match_score}% for this job.
+Matched: {matched}
+Missing: {missing}
+Partial: {partial}
+Experience: {exp_data}
+
+Write 2 sentences: (1) honest verdict — should they apply? (2) the single most important thing to fix.
+Be direct and specific."""
+
+    recommendation = ask_ai([{"role": "user", "content": rec_prompt}])
 
     return {
         "match_score": match_score,
         "matched_skills": matched,
         "missing_skills": missing,
+        "partial_skills": partial,
         "recommendation": recommendation.strip(),
+        "experience_info": exp_data,
         "total_skills_in_jd": len(jd_skills),
         "total_skills_matched": len(matched)
     }
@@ -309,41 +403,125 @@ async def fit_score(req: FitRequest):
 @app.post("/search-jobs")
 async def search_jobs(req: JobSearchRequest):
     cv_text = get_cv(req.user_id)
-    cv_summary = cv_text[:500] if cv_text else "No CV uploaded yet"
 
-    prompt = f"""You are a senior job placement specialist for Bangladesh's tech industry with deep knowledge of the current job market.
+    # Step 1: Try real Adzuna API first
+    real_jobs = []
+    try:
+        # Search in Bangladesh (country code: bd)
+        adzuna_url = "https://api.adzuna.com/v1/api/jobs/gb/search/1"
+        params = {
+            "app_id": ADZUNA_APP_ID,
+            "app_key": ADZUNA_APP_KEY,
+            "what": req.query,
+            "results_per_page": 5,
+            "content-type": "application/json"
+        }
+        response = httpx.get(adzuna_url, params=params, timeout=10)
+        data = response.json()
+        real_jobs = data.get("results", [])
+    except Exception as e:
+        print(f"Adzuna error: {e}")
 
-CANDIDATE PROFILE:
-{cv_summary}
+    if real_jobs:
+        # Step 2: Process real jobs and compute fit score for each
+        cv_lower = cv_text.lower() if cv_text else ""
+        processed = []
 
-SEARCH: "{req.query}"
+        for job in real_jobs[:4]:
+            title = job.get("title", "Unknown Role")
+            company = job.get("company", {}).get("display_name", "Unknown Company")
+            location = job.get("location", {}).get("display_name", "United Kingdom")
+            description = job.get("description", "")
+            salary_min = job.get("salary_min")
+            salary_max = job.get("salary_max")
+            redirect_url = job.get("redirect_url", "")
 
-Generate 3 highly realistic, currently available job listings. Use ONLY these real Bangladesh tech companies:
-Brain Station 23, Chaldal, Shajgoj, 10 Minute School, Shohoz, Pathao, bKash, BJIT, Kaz Software, DataSoft, Samsung R&D Bangladesh, Therap BD.
+            # Format salary
+            if salary_min and salary_max:
+                salary = f"£{int(salary_min):,} - £{int(salary_max):,}/yr"
+            elif salary_min:
+                salary = f"£{int(salary_min):,}+/yr"
+            else:
+                salary = "Salary not specified"
 
-Make salary ranges accurate for 2026 Bangladesh market.
-Fit scores must be honest based on the candidate's actual background.
-why_matches must reference specific things from their CV.
+            # Compute fit score by keyword overlap
+            if cv_text and description:
+                desc_words = set(description.lower().split())
+                cv_words = set(cv_lower.split())
+                common = desc_words & cv_words
+                # Filter out noise words
+                noise = {"the","a","an","and","or","in","at","to","of","for","is","are","with","that","this","on","be","as","it","by","from","have","has","was","will","can","not","but","we","you","our","your","their","they","also","more","all","been","an","its","we","which"}
+                common = {w for w in common if len(w) > 3 and w not in noise}
+                fit_score = min(round(len(common) / max(len(desc_words - noise), 1) * 150), 98)
+            else:
+                fit_score = 50
 
-Respond in EXACT JSON — no extra text:
+            # Get why it matches using AI
+            why_prompt = f"""In ONE sentence, explain why this job matches or doesn't match the candidate.
+Job: {title} at {company}
+Job description snippet: {description[:300]}
+Candidate CV snippet: {cv_text[:300]}
+Be specific. Reference actual skills."""
+
+            why = ask_ai([{"role": "user", "content": why_prompt}])
+
+            # Extract required skills from description using AI
+            skills_prompt = f"""List the top 5 required technical skills from this job description as a JSON array. Example: ["Python", "SQL", "React"]. Return ONLY the array.
+Description: {description[:500]}"""
+            skills_raw = ask_ai([{"role": "user", "content": skills_prompt}])
+            try:
+                skills_raw = skills_raw.replace("```json","").replace("```","").strip()
+                required_skills = json.loads(skills_raw[skills_raw.find("["):skills_raw.rfind("]")+1])
+            except:
+                required_skills = ["See job description"]
+
+            processed.append({
+                "title": title,
+                "company": company,
+                "location": location,
+                "salary": salary,
+                "deadline": "See listing",
+                "fit_score": fit_score,
+                "why_matches": why.strip(),
+                "required_skills": required_skills,
+                "apply_url": redirect_url,
+                "source": "real"
+            })
+
+        return {"jobs": processed}
+
+    else:
+        # Fallback: AI generated but clearly labelled
+        cv_summary = cv_text[:400] if cv_text else "No CV uploaded"
+        prompt = f"""You are a job search assistant. The real job API is unavailable.
+
+Generate 3 realistic job listings based on:
+CV: {cv_summary}
+Query: "{req.query}"
+
+Use real companies that actually exist globally.
+Be honest about salaries.
+
+Return EXACT JSON:
 {{
   "jobs": [
     {{
-      "title": "Backend Engineer Intern",
-      "company": "Brain Station 23",
-      "location": "Dhaka, Bangladesh",
-      "salary": "BDT 20,000-25,000/mo",
-      "deadline": "Jul 15, 2026",
-      "fit_score": 88,
-      "why_matches": "Your FastAPI internship at Shohoz directly matches their Python microservices stack",
-      "required_skills": ["Python", "FastAPI", "PostgreSQL", "REST APIs"]
+      "title": "Backend Engineer",
+      "company": "Accenture",
+      "location": "London, UK",
+      "salary": "£35,000-£45,000/yr",
+      "deadline": "Rolling applications",
+      "fit_score": 78,
+      "why_matches": "Your FastAPI experience matches their Python backend requirements",
+      "required_skills": ["Python", "FastAPI", "SQL"],
+      "apply_url": "",
+      "source": "ai_generated"
     }}
   ]
 }}"""
-
-    result = ask_ai([{"role": "user", "content": prompt}])
-    parsed = parse_json(result)
-    return parsed if parsed else {"jobs": []}
+        result = ask_ai([{"role": "user", "content": prompt}])
+        parsed = parse_json(result)
+        return parsed if parsed else {"jobs": []}
 
 
 # ── Cover Letter ───────────────────────────────────────────────
@@ -556,6 +734,8 @@ async def get_dashboard(user_id: str):
 @app.delete("/memory/{user_id}")
 async def clear_memory(user_id: str):
     memory_store[user_id] = []
+    url = f"{SUPABASE_URL}/rest/v1/conversation_memory?user_id=eq.{user_id}"
+    httpx.delete(url, headers=HEADERS)
     return {"message": "Memory cleared!"}
 
 # ── Calendar Events ────────────────────────────────────────────
